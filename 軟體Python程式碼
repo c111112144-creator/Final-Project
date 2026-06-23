@@ -1,0 +1,297 @@
+import cv2
+import numpy as np
+import os
+from google.colab import files
+
+# ============================================================
+# 火焰偵測演算法
+# 功能：
+# 1. 空間驗證：強光源的「左、右、上」三方必須同時擁有紅橘色包覆。
+# 2. 時間驗證：追蹤光源大小(像素面積)是否持續在改變(過濾靜態反光)。
+# 3. 多目標融合：框出所有火源，若框與框太近或碰觸則自動合併。
+# ============================================================
+
+VIDEO_PATH = '/content/1.mp4' # <--- 確認影片路徑
+
+if not os.path.exists(VIDEO_PATH):
+    mp4_files = [f for f in os.listdir('.') if f.endswith('.mp4') or f.endswith('.mov')]
+    if mp4_files:
+        VIDEO_PATH = mp4_files[0]
+    else:
+        raise RuntimeError("找不到影片")
+
+print("目前處理的影片：", VIDEO_PATH)
+
+OUTPUT_PREVIEW = "fire_ball.mp4"
+
+# 內部運算解析度
+DETECT_W = 320
+DETECT_H = 240
+
+def make_fire_masks(frame_bgr):
+    """ 拆分光源遮罩與火焰顏色遮罩 """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    b, g, r = cv2.split(frame_bgr)
+    h, s, v = cv2.split(hsv)
+
+    # 1. 強光光源遮罩 (發光體核心)
+    light_source_mask = ((r > 210) & (g > 210) & (b > 140) & (v > 210)).astype(np.uint8) * 255
+
+    # 2. 紅橘黃色遮罩
+    mask_orange_yellow = cv2.inRange(hsv, np.array([0, 55, 90]), np.array([38, 255, 255]))
+    mask_red = cv2.inRange(hsv, np.array([162, 55, 90]), np.array([179, 255, 255]))
+    hsv_color = cv2.bitwise_or(mask_orange_yellow, mask_red)
+    rgb_color = ((r > 125) & (g > 60) & (r > g + 12) & (g > b + 5)).astype(np.uint8) * 255
+    flame_color_mask = cv2.bitwise_and(hsv_color, rgb_color)
+
+    return light_source_mask, flame_color_mask
+
+def is_close_or_overlap(box1, box2, dist_thresh=12):
+    """ 判斷兩個框是否距離太近或碰觸在一起 """
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    # 將 box1 向外擴展 dist_thresh 像素，看是否與 box2 相交
+    return not (x1 + w1 + dist_thresh < x2 or 
+                x2 + w2 + dist_thresh < x1 or 
+                y1 + h1 + dist_thresh < y2 or 
+                y2 + h2 + dist_thresh < y1)
+
+def merge_neighbor_boxes(boxes, dist_thresh=12):
+    """ 將距離太近或重疊的框融合為一個大火焰框 """
+    if not boxes: return []
+    merged = []
+    visited = [False] * len(boxes)
+    
+    for i in range(len(boxes)):
+        if visited[i]: continue
+        group = [boxes[i]]
+        visited[i] = True
+        
+        # 尋找同一個聚合組
+        recheck = True
+        while recheck:
+            recheck = False
+            for j in range(len(boxes)):
+                if visited[j]: continue
+                for g_box in group:
+                    if is_close_or_overlap(g_box, boxes[j], dist_thresh):
+                        group.append(boxes[j])
+                        visited[j] = True
+                        recheck = True
+                        break
+        
+        # 計算這一組框聯集後的邊界
+        x1 = min(b[0] for b in group)
+        y1 = min(b[1] for b in group)
+        x2 = max(b[0] + b[2] for b in group)
+        y2 = max(b[1] + b[3] for b in group)
+        merged.append((x1, y1, x2 - x1, y2 - y1))
+        
+    return merged
+
+def main():
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened(): 
+        raise RuntimeError(f"無法開啟影片: {VIDEO_PATH}")
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    src_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if src_fps <= 0: src_fps = 30.0
+
+    print("====================================")
+    print(f"原始解析度: {src_w} x {src_h} | FPS: {src_fps}")
+    print("正在執行【三向顏色包覆 + 光源大小動態變更 + 多目標融合】演算法...")
+    print("====================================")
+
+    preview_writer = cv2.VideoWriter(
+        OUTPUT_PREVIEW,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        src_fps,
+        (src_w, src_h)
+    )
+
+    # --------------------------------------------------------
+    # 時間維度追蹤器資料結構
+    # tracked_fires = { id: {"box": (x,y,w,h), "area_history": [...], "missing_count": 0} }
+    # --------------------------------------------------------
+    tracked_fires = {}
+    next_fire_id = 0
+    
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+
+        detect_frame = cv2.resize(frame, (DETECT_W, DETECT_H), interpolation=cv2.INTER_AREA)
+        light_mask, color_mask = make_fire_masks(detect_frame)
+        
+        # 找出當前影格中所有光源的輪廓
+        contours, _ = cv2.findContours(light_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        candidate_boxes = []
+        
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < 3: # 過濾超小微噪點
+                continue
+            
+            x, y, w, h = cv2.boundingRect(c)
+            
+            # 【功能 1：左、右、上 三向顏色包覆驗證】
+            # 設定向外探測的鄰域間距
+            pad_x = max(5, int(w * 0.5))
+            pad_y = max(5, int(h * 0.6))
+            
+            # 1. 左側探測區 (光源左邊界往左延伸 pad_x，垂直高度與光源相同)
+            left_roi = color_mask[y:y+h, max(0, x - pad_x):x]
+            # 2. 右側探測區 (光源右邊界往右延伸 pad_x，垂直高度與光源相同)
+            right_roi = color_mask[y:y+h, x+w:min(DETECT_W, x + w + pad_x)]
+            # 3. 上方探測區 (光源上邊界往上延伸 pad_y，水平寬度與光源相同)
+            top_roi = color_mask[max(0, y - pad_y):y, x:x+w]
+            
+            # 檢查各區域是否含有紅橘色像素 (至少要有2個像素，防零星雜訊)
+            has_left = np.sum(left_roi > 0) >= 2
+            has_right = np.sum(right_roi > 0) >= 2
+            has_top = np.sum(top_roi > 0) >= 2
+            
+            # 必須「左、右、上」同時成立，不能只有單邊
+            if has_left and has_right and has_top:
+                # 為了將包覆的紅橘色一起框進來，將框稍微擴大結合
+                roi_union = cv2.bitwise_or(light_mask[max(0,y-2):min(DETECT_H,y+h+2), max(0,x-2):min(DETECT_W,x+w+2)], 
+                                           color_mask[max(0,y-2):min(DETECT_H,y+h+2), max(0,x-2):min(DETECT_W,x+w+2)])
+                pts = np.argwhere(roi_union > 0)
+                if pts.size > 0:
+                    candidate_boxes.append((x, y, w, h))
+                else:
+                    candidate_boxes.append((x, y, w, h))
+
+        # 【功能 2：多目標框融合機制】若距離太近或碰觸，判定為同一個火焰
+        merged_current_boxes = merge_neighbor_boxes(candidate_boxes, dist_thresh=14)
+
+        # --------------------------------------------------------
+        # 【功能 3：時間維度 - 光源大小持續改變驗證 (多目標追蹤與配對)】
+        # --------------------------------------------------------
+        matched_ids = set()
+        
+        for box in merged_current_boxes:
+            bx, by, bw, bh = box
+            b_cx, b_cy = bx + bw/2, by + bh/2
+            # 計算該區域內實際的光源像素大小 (用來監測大小有沒有在改變)
+            current_light_area = float(np.sum(light_mask[by:by+bh, bx:bx+bw] > 0))
+            
+            # 與上一影格已存在的追蹤目標進行歐式距離配對
+            best_id = None
+            min_dist = 99999.0
+            
+            for fid, fdata in tracked_fires.items():
+                if fid in matched_ids: continue
+                fx, fy, fw, fh = fdata["box"]
+                f_cx, f_cy = fx + fw/2, fy + fh/2
+                dist = np.sqrt((b_cx - f_cx)**2 + (b_cy - f_cy)**2)
+                
+                # 允許目標在 35 像素半徑內移動配對
+                if dist < 35 and dist < min_dist:
+                    min_dist = dist
+                    best_id = fid
+            
+            if best_id is not None:
+                # 成功配對：更新位置，紀錄光源大小歷史
+                tracked_fires[best_id]["box"] = box
+                tracked_fires[best_id]["area_history"].append(current_light_area)
+                if len(tracked_fires[best_id]["area_history"]) > 10: # 保持最近10影格
+                    tracked_fires[best_id]["area_history"].pop(0)
+                tracked_fires[best_id]["missing_count"] = 0
+                matched_ids.add(best_id)
+            else:
+                # 新出現的光源：建立新追蹤 ID
+                tracked_fires[next_fire_id] = {
+                    "box": box,
+                    "area_history": [current_light_area],
+                    "missing_count": 0
+                }
+                matched_ids.add(next_fire_id)
+                next_fire_id += 1
+
+        # 處理沒配對到的漏失目標 (允許短暫殘留 3 幀防止閃爍不見)
+        for fid in list(tracked_fires.keys()):
+            if fid not in matched_ids:
+                tracked_fires[fid]["missing_count"] += 1
+                if tracked_fires[fid]["missing_count"] > 3:
+                    del tracked_fires[fid]
+
+        # --------------------------------------------------------
+        # 畫布繪製與嚴格篩選
+        # --------------------------------------------------------
+        preview = frame.copy()
+        
+        base_scale = src_w / 1920.0
+        text_scale = max(0.6, 1.2 * base_scale)
+        text_thickness = max(1, int(3 * base_scale))
+        rect_thickness = max(2, int(5 * base_scale))
+        line_height = max(20, int(40 * base_scale))
+
+        fire_detected_this_frame = False
+
+        for fid, fdata in tracked_fires.items():
+            if fdata["missing_count"] > 0: 
+                continue
+                
+            history = fdata["area_history"]
+            
+            # 核心驗證：當累積超過 4 影格時，檢查光源大小(像素量)是否有一直在改變
+            if len(history) >= 4:
+                mean_area = np.mean(history)
+                if mean_area > 0:
+                    # 計算最大與最小面積的相對波動比例
+                    area_fluctuation = (max(history) - min(history)) / mean_area
+                    # 如果波動比例小於 3% (0.03)，代表這個發光體的大小死板板固定不變，判定為非火焰(剔除)
+                    if area_fluctuation < 0.03:
+                        continue
+            
+            # 通過所有考驗，確定為真火焰，將低解析度座標逆映射回大圖
+            fire_detected_this_frame = True
+            rx, ry, rw, rh = fdata["box"]
+            x1 = int(rx * src_w / DETECT_W)
+            y1 = int(ry * src_h / DETECT_H)
+            x2 = int((rx + rw) * src_w / DETECT_W)
+            y2 = int((ry + rh) * src_h / DETECT_H)
+            
+            # 給予外框適度包覆緩衝
+            pad = int((x2 - x1) * 0.1)
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(src_w - 1, x2 + pad)
+            y2 = min(src_h - 1, y2 + pad)
+
+            # 畫出所有獨立的火焰紅框
+            cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 0, 255), rect_thickness)
+
+        # 狀態標籤文字
+        if fire_detected_this_frame:
+            txt = "FIRE DETECTED"
+            cv2.putText(preview, txt, (20, int(line_height * 1.5)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 0, 0), text_thickness+1, cv2.LINE_AA)
+            cv2.putText(preview, txt, (20, int(line_height * 1.5)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 0, 255), text_thickness, cv2.LINE_AA)
+        else:
+            txt = "STATUS: NORMAL"
+            cv2.putText(preview, txt, (20, int(line_height * 1.5)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 0, 0), text_thickness+1, cv2.LINE_AA)
+            cv2.putText(preview, txt, (20, int(line_height * 1.5)), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 255, 0), text_thickness, cv2.LINE_AA)
+
+        preview_writer.write(preview)
+        frame_idx += 1
+        if frame_idx % 100 == 0:
+            print(f"已處理 {frame_idx} / {src_frames} 影格...")
+
+    cap.release()
+    preview_writer.release()
+    print("\n====================================")
+    print("終極優化版高清影片已成功生成！")
+    print("檔案名稱:", OUTPUT_PREVIEW)
+    print("====================================")
+    
+    files.download(OUTPUT_PREVIEW)
+
+if __name__ == "__main__":
+    main()
