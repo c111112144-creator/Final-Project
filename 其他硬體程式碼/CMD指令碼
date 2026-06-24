@@ -1,0 +1,2 @@
+cd desktop
+py send_fire_video_uart_fast_rgb332.py --video fire2.mp4 --port COM3 --baud 4000000 --fps 15 --loop --preview
