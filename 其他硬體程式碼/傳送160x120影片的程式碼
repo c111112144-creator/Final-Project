@@ -1,0 +1,158 @@
+import argparse
+import sys
+import time
+
+import cv2
+import numpy as np
+import serial
+from serial.tools import list_ports
+
+WIDTH = 160
+HEIGHT = 120
+
+# FPGA 用這 4 bytes 找 frame 開頭
+HEADER = bytes([0xA5, 0x5A, 0xA5, 0x5A])
+
+
+def bgr_to_rgb332_bytes(frame_bgr):
+    """
+    OpenCV BGR 轉成 RGB332。
+    每個像素只傳 1 byte：
+    bit[7:5] = R
+    bit[4:2] = G
+    bit[1:0] = B
+    """
+    if frame_bgr.shape[1] != WIDTH or frame_bgr.shape[0] != HEIGHT:
+        frame_bgr = cv2.resize(frame_bgr, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
+
+    b = frame_bgr[:, :, 0].astype(np.uint8)
+    g = frame_bgr[:, :, 1].astype(np.uint8)
+    r = frame_bgr[:, :, 2].astype(np.uint8)
+
+    rgb332 = ((r >> 5) << 5) | ((g >> 5) << 2) | (b >> 6)
+    return rgb332.reshape(-1).tobytes()
+
+
+def list_serial_ports():
+    ports = list(list_ports.comports())
+    if not ports:
+        print("找不到序列埠，請確認 Basys3 USB-UART 有接上。")
+        return
+
+    print("可用序列埠：")
+    for p in ports:
+        print(f"{p.device:8s} {p.description}")
+
+
+def open_serial(port, baud):
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0,
+            write_timeout=2,
+            rtscts=False,
+            dsrdtr=False,
+            xonxoff=False,
+        )
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        return ser
+    except Exception as e:
+        print("無法開啟 UART：", e)
+        sys.exit(1)
+
+
+def send_video(video_path, port, baud, fps, loop, preview):
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        print("無法開啟影片：", video_path)
+        sys.exit(1)
+
+    ser = open_serial(port, baud)
+
+    frame_interval = 1.0 / fps if fps > 0 else 0
+    frame_count = 0
+
+    print("開始傳送")
+    print(f"影片   : {video_path}")
+    print(f"解析度 : {WIDTH}x{HEIGHT}")
+    print(f"格式   : RGB332，每像素 1 byte")
+    print(f"UART   : {port}, {baud} baud")
+    print(f"FPS    : {fps}")
+    print("按 Ctrl+C 停止")
+
+    try:
+        while True:
+            t0 = time.perf_counter()
+
+            ok, frame = cap.read()
+
+            if not ok:
+                if loop:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                else:
+                    break
+
+            frame = cv2.resize(frame, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
+            payload = bgr_to_rgb332_bytes(frame)
+
+            # 一次送出，速度比 ser.write(header) + ser.write(payload) 更穩
+            ser.write(HEADER + payload)
+
+            frame_count += 1
+
+            if frame_count % 30 == 0:
+                print(f"已傳送 {frame_count} frames")
+
+            if preview:
+                cv2.imshow("Python preview 160x120", frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+
+            used = time.perf_counter() - t0
+            remain = frame_interval - used
+            if remain > 0:
+                time.sleep(remain)
+
+    except KeyboardInterrupt:
+        print("\n停止傳送")
+    finally:
+        cap.release()
+        ser.close()
+        if preview:
+            cv2.destroyAllWindows()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="160x120 RGB332 UART video sender for Basys3")
+    parser.add_argument("--video", default="IMG_3284.mp4")
+    parser.add_argument("--port", default="COM3")
+    parser.add_argument("--baud", type=int, default=4000000)
+    parser.add_argument("--fps", type=float, default=15)
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--list-ports", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.list_ports:
+        list_serial_ports()
+        sys.exit(0)
+
+    send_video(
+        video_path=args.video,
+        port=args.port,
+        baud=args.baud,
+        fps=args.fps,
+        loop=args.loop,
+        preview=args.preview
+    )
